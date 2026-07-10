@@ -9,12 +9,15 @@ import re
 import string
 import time
 import traceback
+import uuid
+from collections.abc import Mapping
 from datetime import datetime
-from urllib.parse import parse_qs, quote, urljoin, urlparse
+from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 
 import httpx
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
+from gmssl import sm2
 
 
 def read_int_env(name, default=None, minimum=None):
@@ -223,11 +226,10 @@ def require_dict_data(r, action=None):
     raise ValueError(api_response_err(r, action))
 
 
-def iter_set_cookies(headers):
+def iter_set_cookies(headers: httpx.Headers | Mapping[str, object]):
     """逐条产出 Set-Cookie 值，避免按逗号拆分误伤 Expires 日期。"""
-    get_list = getattr(headers, "get_list", None)
-    if callable(get_list):
-        for item in get_list("set-cookie") or get_list("Set-Cookie") or []:
+    if isinstance(headers, httpx.Headers):
+        for item in headers.get_list("set-cookie") or headers.get_list("Set-Cookie") or []:
             if item:
                 yield item.strip()
         return
@@ -256,9 +258,7 @@ class Unicom:
         self.battle_page_referer = ""
 
         # 生成UUID用于签到
-        import uuid as uuid_lib
-
-        self.uuid = str(uuid_lib.uuid4())
+        self.uuid = str(uuid.uuid4())
 
         self.client = httpx.AsyncClient(
             http2=False,
@@ -775,11 +775,24 @@ class Unicom:
             headers=self.market_auth_headers(),
             json={},
         )
-        res = r.get("data") if isinstance(r.get("data"), dict) else {}
-        if res.get("code") != 200 or not res.get("data"):
+        res = require_dict_data(r, "selectInfo")
+        data = res.get("data")
+        if res.get("code") != 200 or not data:
             self.tlog(f"优享权益: 会员状态查询失败 {api_response_err(r, 'selectInfo')}")
             return None
-        info = res["data"][0] if isinstance(res["data"], list) else res["data"]
+        if isinstance(data, list):
+            first = data[0]
+            if not isinstance(first, dict):
+                raise ValueError(
+                    f"selectInfo data[0] 须为 dict，实际为 {type(first).__name__}"
+                )
+            info = first
+        elif isinstance(data, dict):
+            info = data
+        else:
+            raise ValueError(
+                f"selectInfo data 须为非空 dict 或非空 list，实际为 {type(data).__name__}"
+            )
         if require_int(info.get("state"), "selectInfo.state") != 1:
             self.tlog("优享权益: 非有效优享会员，跳过")
             return None
@@ -801,16 +814,25 @@ class Unicom:
             headers=self.market_auth_headers(),
             json=payload,
         )
-        res = r.get("data") if isinstance(r.get("data"), dict) else {}
-        if res.get("code") != 200 or not res.get("data"):
+        res = require_dict_data(r, "getActivitiesDetail/v2")
+        data = res.get("data")
+        if res.get("code") != 200 or not data:
             self.tlog(
                 f"优享权益: 活动查询失败 {api_response_err(r, 'getActivitiesDetail/v2')}"
             )
             return None
-        for act in res["data"]:
+        if not isinstance(data, list):
+            raise ValueError(
+                f"getActivitiesDetail/v2 data 须为 list，实际为 {type(data).__name__}"
+            )
+        for act in data:
+            if not isinstance(act, dict):
+                raise ValueError(
+                    f"getActivitiesDetail/v2 data 元素须为 dict，实际为 {type(act).__name__}"
+                )
             if act.get("activityCode") == "YOUCHOICEONE":
                 return act
-        return res["data"][0] if res["data"] else None
+        return data[0]
 
     def market_build_try_order(self, detail_list):
         """优先当日惊喜[0]；本周期已领则按 n-1..1 倒序，跳过 status=3。"""
@@ -886,7 +908,7 @@ class Unicom:
                 "activityId": first.get("activityId") or act.get("activityId"),
             },
         )
-        res = r.get("data") if isinstance(r.get("data"), dict) else {}
+        res = require_dict_data(r, "unlockSurprise")
         if res.get("code") == 200:
             self.tlog(f"优享权益: 惊喜解锁成功 {res.get('msg', '')}")
             await asyncio.sleep(1.5)
@@ -911,7 +933,7 @@ class Unicom:
             headers=self.market_auth_headers(),
             json=payload,
         )
-        return r.get("data") if isinstance(r.get("data"), dict) else {}
+        return require_dict_data(r, "receiveRightsVip")
 
     async def market_man_machine(self, activity_id):
         if not activity_id:
@@ -922,7 +944,7 @@ class Unicom:
             headers=self.market_auth_headers(),
             json={},
         )
-        res = r.get("data") if isinstance(r.get("data"), dict) else {}
+        res = require_dict_data(r, "manMachine")
         return res.get("code") == 200
 
     async def market_login(self):
@@ -1653,8 +1675,6 @@ class Unicom:
         self.sec_ticket = res["data"].get("ticket")
 
         # 获取密钥
-        from urllib.parse import unquote
-
         sec_jea_id = ""
         t = unquote(self.sec_ticket) if self.sec_ticket else ""
         r = await self.req(
@@ -2508,15 +2528,14 @@ class Unicom:
         if not text.startswith("04"):
             return {"raw": text}
         try:
-            from gmssl import sm2
-
             plain = sm2.CryptSM2(
                 private_key=SHANGDU_SM2_PRIVATE_KEY, public_key=""
             ).decrypt(bytes.fromhex(text[2:].lower()))
+            if not isinstance(plain, (bytes, bytearray)) or not plain:
+                raise ValueError(
+                    f"SM2解密返回非法类型或空值: {type(plain).__name__}"
+                )
             return json.loads(plain.decode("utf-8"))
-        except ImportError:
-            self.tlog("未安装 gmssl，无法解密响应 (pip install gmssl)")
-            return {"_cipher": text}
         except Exception as e:
             self.tlog_exc(e, "SM2解密")
             return {"_cipher": text}
@@ -2739,11 +2758,9 @@ class Unicom:
                     "LOTTERY_CLICK", "抽奖点击", "lottery", "C"
                 )
                 if self.shangdu_api_ok(lottery_r):
-                    body = (
-                        lottery_r.get("data")
-                        if isinstance(lottery_r.get("data"), dict)
-                        else {}
-                    )
+                    body = lottery_r.get("data")
+                    if not isinstance(body, dict):
+                        body = {}
                     prize_idx = body.get("data")
                     prize_name = self.shangdu_lottery_prize_name(
                         prize_idx, bool(lottery_info.get("isFestival"))
@@ -3209,7 +3226,8 @@ class Unicom:
                 self.yphd_log(f"订阅权益 {off_msg}")
                 await asyncio.sleep(8 + retry * 6)
                 data = await self.yphd_mgtv_template_submit(payload)
-            result = data.get("data") or {}
+            raw_result = data.get("data")
+            result = raw_result if isinstance(raw_result, dict) else {}
             task_id = result.get("taskId") or data.get("taskId")
             if not task_id:
                 msg = data.get("msg") or response_summary(data)
@@ -3228,7 +3246,8 @@ class Unicom:
                     result_r["data"] if isinstance(result_r.get("data"), dict) else {}
                 )
                 try:
-                    info = result_data.get("data") or {}
+                    raw_info = result_data.get("data")
+                    info = raw_info if isinstance(raw_info, dict) else {}
                     audit_state = safe_int(info.get("auditState"))
                     algorithm_state = safe_int(info.get("algorithmState"))
                     if result_data.get("errno") == "0" and (
@@ -3585,7 +3604,13 @@ class Unicom:
             self.battle_log(f"上传异常: {self.format_exc(e, 'upload2C')}")
             return False
         if str(data.get("code")) == "0000":
-            fid = (data.get("data") or {}).get("fid", "")
+            raw_data = data.get("data")
+            if not isinstance(raw_data, dict):
+                self.battle_log(
+                    f"上传失败 {data.get('msg') or response_summary(data)}"
+                )
+                return False
+            fid = raw_data.get("fid", "")
             self.battle_log(
                 f"上传成功 {file_name} ({len(content)}B) fid={str(fid)[:24]}..."
             )
