@@ -121,6 +121,28 @@ SHANGDU_LOTTERY_PRIZES = [
 SHANGDU_LOTTERY_FESTIVAL_PRIZES = ["30元话费券", *SHANGDU_LOTTERY_PRIZES]
 SHANGDU_LOTTERY_MAX = read_int_env("SHANGDU_LOTTERY_MAX", default=None, minimum=0)
 
+# 云手机积分 / 夏日刮一刮
+UPHONE_H5API = "https://uphone.wostore.cn/h5api"
+UPHONE_WO_ADV = "https://uphone.wo-adv.cn"
+UPHONE_CHANNEL = "ST-Wode"
+UPHONE_CHANNEL_H5 = "ST-Jingang002"
+UPHONE_EDOP_APP_ID = "edop_unicom_68e8fa69"
+UPHONE_ACT_SIGN = "Points_Sign_2507"
+UPHONE_ACT_OBTAIN = "Points_Obtain_2507"
+UPHONE_ACT_EXCHANGE = "Points_Exchange_2507"
+UPHONE_ACT_SUMMER = "HD2026062200218"
+UPHONE_GOODS_LOTTERY_10 = "2026031010"
+UPHONE_LOTTERY_COST = read_int_env("UNICOM_UPHONE_LOTTERY_COST", default=100, minimum=1)
+UPHONE_OBTAIN_SKIP = frozenset({"012-4", "TASK2026010601"})
+UPHONE_APP_UA = (
+    "ChinaUnicom4.x/12.13 (com.chinaunicom.mobilebusiness; build:1; iOS 27.0.0) "
+    "Alamofire/4.7.3 unicom{version:iphone_c@12.1300}"
+)
+UPHONE_H5_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko)  unicom{version:iphone_c@12.1300};ltst;OSVersion/27.0"
+)
+
 
 def require_int(value, field, minimum=None):
     """必填业务整数：仅接受非 bool 的 int，或可由 int() 完整解析的 str；可选 minimum 下限。"""
@@ -256,6 +278,7 @@ class Unicom:
         self.ttxc_newbie_list = []
         self.ttxc_charge_level = {}
         self.battle_page_referer = ""
+        self.uphone_cp_token = self.uphone_usr_token = self.uphone_device_id = ""
 
         # 生成UUID用于签到
         self.uuid = str(uuid.uuid4())
@@ -3738,6 +3761,387 @@ class Unicom:
 
         await self.battle_draw_lottery()
 
+    # === 云手机积分 / 夏日刮一刮 ===
+    def uphone_biz_ok(self, data):
+        """业务成功：data 必须为 dict 且 code 表示成功。"""
+        if not isinstance(data, dict):
+            return False
+        return data.get("code") in (200, "200", 0, "0")
+
+    def uphone_biz_data(self, r):
+        """取出 req() 的 data 字段；非 dict 时返回 None。"""
+        if not isinstance(r, dict):
+            return None
+        data = r.get("data")
+        return data if isinstance(data, dict) else None
+
+    def uphone_app_headers(self, extra=None):
+        h = {
+            "User-Agent": UPHONE_APP_UA,
+            "Accept": "*/*",
+            "channel": UPHONE_CHANNEL,
+            "channelCode": UPHONE_CHANNEL,
+            "deviceId": self.uphone_device_id or "0",
+        }
+        if self.uphone_cp_token:
+            h["Authorization"] = self.uphone_cp_token
+        if extra:
+            h.update(extra)
+        return h
+
+    def uphone_h5_headers(self, extra=None):
+        h = {
+            "User-Agent": UPHONE_H5_UA,
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/json; charset=UTF-8",
+            "Origin": "https://uphone.wostore.cn",
+        }
+        if self.uphone_usr_token:
+            h["X-USR-TOKEN"] = self.uphone_usr_token
+        if extra:
+            h.update(extra)
+        return h
+
+    async def uphone_sso_login(self):
+        """ecs_token → ticket → cpToken"""
+        if not self.ecs_token:
+            self.tlog("无 ecs_token")
+            return False
+        self.uphone_device_id = hashlib.md5(
+            f"{self.mobile or self.uuid}".encode()
+        ).hexdigest()
+
+        r = await self.req(
+            "GET",
+            "https://m.client.10010.com/edop_ng/getTicketByNative",
+            params={"token": self.ecs_token, "appId": UPHONE_EDOP_APP_ID},
+            headers={"User-Agent": UPHONE_APP_UA, "Accept": "*/*"},
+        )
+        body = self.uphone_biz_data(r)
+        ticket = body.get("ticket") if body else None
+        if not ticket:
+            self.tlog(f"换 ticket 失败: {api_response_err(r, 'getTicketByNative')}")
+            return False
+
+        r = await self.req(
+            "POST",
+            f"{UPHONE_H5API}/token-service/getTokenByTicket",
+            headers=self.uphone_app_headers({"Content-Type": "application/json"}),
+            json={"channel": UPHONE_CHANNEL, "ticket": ticket},
+        )
+        body = self.uphone_biz_data(r)
+        token = body.get("data") if body else None
+        if not (
+            body
+            and self.uphone_biz_ok(body)
+            and isinstance(token, str)
+            and token.startswith("eyJ")
+        ):
+            self.tlog(f"换 cpToken 失败: {api_response_err(r, 'getTokenByTicket')}")
+            return False
+        self.uphone_cp_token = token
+        self.tlog("云手机 SSO 成功")
+        return True
+
+    async def uphone_activity_login(self, activity_id):
+        if not self.uphone_cp_token:
+            return False
+        r = await self.req(
+            "POST",
+            f"{UPHONE_H5API}/activity-service/user/login",
+            headers=self.uphone_h5_headers(),
+            json={
+                "identityType": "cloudPhoneLogin",
+                "code": self.uphone_cp_token,
+                "channelId": UPHONE_CHANNEL_H5,
+                "activityId": activity_id,
+                "device": "device",
+            },
+        )
+        body = self.uphone_biz_data(r)
+        nested = body.get("data") if body else None
+        tok = nested.get("user_token") if isinstance(nested, dict) else None
+        if not (body and self.uphone_biz_ok(body) and tok):
+            self.tlog(f"活动登录失败({activity_id}): {api_response_err(r, 'user/login')}")
+            return False
+        self.uphone_usr_token = str(tok)
+        return True
+
+    async def uphone_points_summary(self):
+        r = await self.req(
+            "GET",
+            f"{UPHONE_H5API}/activity-service/points/v1/summary",
+            headers=self.uphone_h5_headers(),
+            params={"activityCode": UPHONE_ACT_EXCHANGE},
+        )
+        body = self.uphone_biz_data(r)
+        if not body or not self.uphone_biz_ok(body):
+            return None
+        nested = body.get("data")
+        return nested if isinstance(nested, dict) else None
+
+    async def uphone_sign(self):
+        r = await self.req(
+            "GET",
+            f"{UPHONE_H5API}/activity-service/points/v1/sign/history",
+            headers=self.uphone_h5_headers(),
+            params={"activityCode": UPHONE_ACT_SIGN},
+        )
+        body = self.uphone_biz_data(r)
+        hist = body.get("data") if body and self.uphone_biz_ok(body) else None
+        records = hist.get("signRecords") if isinstance(hist, dict) else None
+        today = records[0] if isinstance(records, list) and records else {}
+        if not isinstance(today, dict):
+            today = {}
+        # signStatus=0 已签，1 未签
+        if today.get("signStatus") == 0:
+            self.tlog("今日已签到")
+            return True
+        r = await self.req(
+            "POST",
+            f"{UPHONE_H5API}/activity-service/points/v1/sign",
+            headers=self.uphone_h5_headers(),
+            json={"activityCode": UPHONE_ACT_SIGN},
+        )
+        body = self.uphone_biz_data(r)
+        if body and self.uphone_biz_ok(body):
+            self.tlog(f"签到成功: {body.get('msg') or 'ok'}")
+            return True
+        self.tlog(f"签到失败: {api_response_err(r, 'points/sign')}")
+        return False
+
+    async def uphone_task_list(self, activity_code):
+        r = await self.req(
+            "POST",
+            f"{UPHONE_H5API}/activity-service/user/task/list",
+            headers=self.uphone_h5_headers(),
+            json={"activityCode": activity_code},
+        )
+        body = self.uphone_biz_data(r)
+        if not body or not self.uphone_biz_ok(body):
+            return [], 0
+        task_list = body.get("taskList") or []
+        if not isinstance(task_list, list):
+            task_list = []
+        return task_list, safe_int(body.get("rafflesLeftCount"), 0)
+
+    async def uphone_task_logs(self, task_code, detail):
+        r = await self.req(
+            "POST",
+            f"{UPHONE_H5API}/activity-service/user/task/logs",
+            headers=self.uphone_h5_headers(),
+            json={
+                "logType": "01",
+                "logCode": task_code,
+                "logSource": "01",
+                "logDetail": detail,
+            },
+        )
+        body = self.uphone_biz_data(r)
+        return self.uphone_biz_ok(body), body
+
+    async def uphone_raffle_get(self, activity_code, task_code):
+        r = await self.req(
+            "POST",
+            f"{UPHONE_H5API}/activity-service/user/task/raffle/get",
+            headers=self.uphone_h5_headers(),
+            json={"activityCode": activity_code, "taskCode": task_code},
+        )
+        body = self.uphone_biz_data(r)
+        if isinstance(body, dict) and body.get("code") in (10301, "10301"):
+            self.tlog(f"领奖受限 {task_code}: {body.get('msg')}")
+            return False, body
+        return self.uphone_biz_ok(body), body
+
+    async def uphone_obtain_tasks(self):
+        """积分任务：logs → 领奖（跳过需真实行为的任务）"""
+        if not await self.uphone_activity_login(UPHONE_ACT_OBTAIN):
+            return
+        tasks, _ = await self.uphone_task_list(UPHONE_ACT_OBTAIN)
+        claimed = logged = skipped = 0
+
+        for t in tasks:
+            if t.get("status") != "UNCLAIMED":
+                continue
+            code = str(t.get("taskCode") or "")
+            ok, _ = await self.uphone_raffle_get(UPHONE_ACT_OBTAIN, code)
+            if ok:
+                claimed += 1
+                self.tlog(f"领取积分任务 {code} {t.get('taskName')} +{t.get('pointsCount')}")
+            await asyncio.sleep(0.25)
+
+        tasks, _ = await self.uphone_task_list(UPHONE_ACT_OBTAIN)
+        for t in tasks:
+            code = str(t.get("taskCode") or "")
+            name = str(t.get("taskName") or code)
+            if t.get("status") != "INCOMPLETE":
+                continue
+            if code in UPHONE_OBTAIN_SKIP:
+                skipped += 1
+                continue
+            ok, body = await self.uphone_task_logs(code, name)
+            if not ok:
+                self.tlog(f"任务上报失败 {code}: {(body or {}).get('msg')}")
+                await asyncio.sleep(0.2)
+                continue
+            logged += 1
+            await asyncio.sleep(0.3)
+            tasks2, _ = await self.uphone_task_list(UPHONE_ACT_OBTAIN)
+            t2 = next((x for x in tasks2 if x.get("taskCode") == code), None)
+            if not t2 or t2.get("status") != "UNCLAIMED":
+                self.tlog(f"任务未达可领 {code} status={t2.get('status') if t2 else '?'}")
+                continue
+            ok, _ = await self.uphone_raffle_get(UPHONE_ACT_OBTAIN, code)
+            if ok:
+                claimed += 1
+                self.tlog(f"完成 {code} {name} +{t.get('pointsCount')}")
+            await asyncio.sleep(0.25)
+
+        summary = await self.uphone_points_summary()
+        bal = (summary or {}).get("balanceScoreNum")
+        self.tlog(
+            f"积分任务结束 claimed={claimed} logged={logged} skipped={skipped} 余额={bal}"
+        )
+
+    async def uphone_lottery10_remain(self):
+        r = await self.req(
+            "GET",
+            f"{UPHONE_H5API}/activity-service/points/v1/exchange/list",
+            headers=self.uphone_h5_headers(),
+            params={
+                "activityCode": UPHONE_ACT_EXCHANGE,
+                "token": self.uphone_cp_token,
+            },
+        )
+        body = self.uphone_biz_data(r)
+        if not body or not self.uphone_biz_ok(body):
+            return -1
+        goods = body.get("data") or []
+        if not isinstance(goods, list):
+            return -1
+        for g in goods:
+            if not isinstance(g, dict):
+                continue
+            if str(g.get("goodsId")) == UPHONE_GOODS_LOTTERY_10:
+                ru = g.get("remainUser")
+                return -1 if ru is None else safe_int(ru, 0)
+        return 0
+
+    async def uphone_lottery_10(self):
+        """余额≥阈值且有剩余次数则十连抽"""
+        await self.uphone_activity_login(UPHONE_ACT_SIGN)
+        summary = await self.uphone_points_summary()
+        balance = safe_int((summary or {}).get("balanceScoreNum"), 0)
+        if balance < UPHONE_LOTTERY_COST:
+            self.tlog(f"积分不足十连 余额={balance} 需≥{UPHONE_LOTTERY_COST}")
+            return
+        remain = await self.uphone_lottery10_remain()
+        if remain == 0:
+            self.tlog("十连次数已用完 remainUser=0")
+            return
+        r = await self.req(
+            "POST",
+            f"{UPHONE_H5API}/activity-service/points/v1/lottery",
+            headers=self.uphone_h5_headers(),
+            json={
+                "activityCode": UPHONE_ACT_EXCHANGE,
+                "goodsId": UPHONE_GOODS_LOTTERY_10,
+            },
+        )
+        body = self.uphone_biz_data(r)
+        if not body or not self.uphone_biz_ok(body):
+            self.tlog(f"十连失败: {api_response_err(r, 'points/lottery')}")
+            return
+        raw_data = body.get("data")
+        data = raw_data if isinstance(raw_data, dict) else {}
+        raw_sm = data.get("summary")
+        sm = raw_sm if isinstance(raw_sm, dict) else {}
+        raw_results = data.get("results")
+        results = raw_results if isinstance(raw_results, list) else []
+        prizes = [
+            x.get("prizeName")
+            for x in results
+            if isinstance(x, dict) and x.get("isDrawn")
+        ]
+        prize_text = ",".join(str(p) for p in prizes if p) if prizes else "无"
+        self.tlog(
+            f"十连完成 total={sm.get('total')} won={sm.get('won')} 奖品={prize_text}"
+        )
+        summary = await self.uphone_points_summary()
+        self.tlog(f"十连后余额={(summary or {}).get('balanceScoreNum')}")
+
+    async def uphone_summer_claim_one(self):
+        """夏日刮一刮：仅领取 1 个可领任务的抽奖次数（优先 2508-01 去赚积分）"""
+        if not await self.uphone_activity_login(UPHONE_ACT_SUMMER):
+            return 0
+        tasks, left = await self.uphone_task_list(UPHONE_ACT_SUMMER)
+        unclaimed = [t for t in tasks if t.get("status") == "UNCLAIMED"]
+        if not unclaimed:
+            self.tlog(f"夏日无可领任务 rafflesLeft={left}")
+            return left
+
+        # 优先「去赚积分」，否则取列表第一个 UNCLAIMED
+        pick = next(
+            (t for t in unclaimed if str(t.get("taskCode")) == "2508-01"),
+            unclaimed[0],
+        )
+        code = str(pick.get("taskCode") or "")
+        name = pick.get("taskName") or code
+        ok, body = await self.uphone_raffle_get(UPHONE_ACT_SUMMER, code)
+        if ok:
+            self.tlog(f"夏日领次数成功 {code} {name}")
+        else:
+            self.tlog(
+                f"夏日领次数失败 {code}: {(body or {}).get('msg') or body}"
+            )
+        _, left2 = await self.uphone_task_list(UPHONE_ACT_SUMMER)
+        self.tlog(f"夏日抽奖次数 rafflesLeft={left}→{left2}")
+        return left2
+
+    async def uphone_summer_lottery(self, max_draws=20):
+        draws = 0
+        while draws < max_draws:
+            _, left = await self.uphone_task_list(UPHONE_ACT_SUMMER)
+            if left <= 0:
+                break
+            r = await self.req(
+                "POST",
+                f"{UPHONE_H5API}/activity-service/lottery",
+                headers=self.uphone_h5_headers(),
+                json={"activityCode": UPHONE_ACT_SUMMER},
+            )
+            body = self.uphone_biz_data(r)
+            if not body or not self.uphone_biz_ok(body):
+                self.tlog(f"夏日抽奖失败: {api_response_err(r, 'lottery')}")
+                break
+            draws += 1
+            self.tlog(
+                f"夏日抽奖#{draws} {body.get('prizeName') or body.get('msg')} "
+                f"type={body.get('prizeType')}"
+            )
+            await asyncio.sleep(0.4)
+        if draws == 0:
+            self.tlog("夏日无抽奖次数")
+        else:
+            self.tlog(f"夏日抽奖结束 draws={draws}")
+        return draws
+
+    async def uphone_task(self):
+        """云手机：签到 → 积分任务 → 满额十连 → 夏日领1次次数并刮奖"""
+        self._task_tag = "云手机积分"
+        self.tlog("开始")
+        if not await self.uphone_sso_login():
+            return
+        if not await self.uphone_activity_login(UPHONE_ACT_SIGN):
+            return
+
+        await self.uphone_sign()
+        await self.uphone_obtain_tasks()
+        await self.uphone_lottery_10()
+        await self.uphone_summer_claim_one()
+        await self.uphone_summer_lottery()
+        self.tlog("结束")
+
     # === 主任务 ===
     async def run(self):
         try:
@@ -3754,6 +4158,7 @@ class Unicom:
                 self.cloudpan_task,
                 self.cloud_battle_task,
                 self.shangdu_task,
+                self.uphone_task,
             ]:
                 try:
                     await task()

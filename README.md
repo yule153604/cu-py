@@ -29,6 +29,17 @@ cu.py
 | 云盘乘风活动 | `cloudpan_task` | 需云盘 token |
 | 上传大比拼 | `cloud_battle_task` | 需云盘 token |
 | 商都福利 | `shangdu_task` | 按归属地跳过 |
+| 云手机积分 | `uphone_task` | 见下方说明 |
+
+### 云手机积分（`uphone_task`）
+
+在手厅 `ecs_token` 基础上换票进入云手机活动体系，顺序为：
+
+1. **SSO**：`getTicketByNative` → `getTokenByTicket` → 活动 `user/login`
+2. **积分签到**（`Points_Sign_2507`）
+3. **赚积分任务**（`Points_Obtain_2507`）：可 API 完成的任务自动上报并领取；讨论区、看广告等需真机行为的任务跳过
+4. **积分十连**：余额 ≥ 阈值且当日仍有次数时执行（默认满 100 分）
+5. **夏日刮一刮**（`HD2026062200218`）：每日只领取 **1 次**抽奖机会（优先「去赚积分」任务），有次数则抽完
 
 ## 快速开始
 
@@ -67,6 +78,7 @@ python cu.py
 | `UNICOM_CLOUD_BATTLE_FILE` | `文本.txt` | 上传文件名 |
 | `UNICOM_CLOUD_BATTLE_CONTENT` | `1` | 上传文件内容 |
 | `SHANGDU_LOTTERY_MAX` | 剩余次数 | 单次最多抽奖次数 |
+| `UNICOM_UPHONE_LOTTERY_COST` | `100` | 云手机积分十连触发余额阈值 |
 
 ## 说明
 
