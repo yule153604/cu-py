@@ -139,6 +139,17 @@ UPHONE_H5_UA = (
     "(KHTML, like Gecko)  unicom{version:iphone_c@12.1300};ltst;OSVersion/27.0"
 )
 
+# 联通客户日（7月答题领密令抽奖 + 专区签到）
+# 活动窗约 7/19–7/25；act/ap 以页面配置为准，可用环境变量覆盖
+MDAY_OCP = "https://c.10010.com/ocp"
+MDAY_ENTRY = "https://c.10010.com/"
+MDAY_H5_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 "
+    "(KHTML, like Gecko) Mobile/15E148 unicom{version:iphone_c@12.1300}"
+)
+MDAY_ACT_ID = os.environ.get("UNICOM_MDAY_ACT_ID", "769")
+MDAY_AP_ID = os.environ.get("UNICOM_MDAY_AP_ID", "2074786685580742656")
+
 
 def require_int(value, field, minimum=None):
     """必填业务整数：仅接受非 bool 的 int，或可由 int() 完整解析的 str；可选 minimum 下限。"""
@@ -289,6 +300,7 @@ class Unicom:
         self.ttxc_charge_level = {}
         self.battle_page_referer = ""
         self.uphone_cp_token = self.uphone_usr_token = self.uphone_device_id = ""
+        self.mday_token = ""
 
         # 生成UUID用于签到
         self.uuid = str(uuid.uuid4())
@@ -3880,23 +3892,326 @@ class Unicom:
         await self.uphone_summer_lottery()
         self.tlog("结束")
 
+    # === 联通客户日：答题 → createKey → 抽奖 → 专区签到 ===
+    def _mday_tea_sign(self, path: str, token: str) -> tuple[str, str]:
+        """
+        OCP 防刷签名（与 H5 axios 拦截器一致）:
+          tea = sha256( (seg[-2] if not 'api-' in seg[-2] else '') + seg[-1] + teatime + token )
+        path 形如 /api-lucky/activity/07/init
+        """
+        teatime = str(int(time.time() * 1000))
+        segs = [s for s in path.split("/") if s]
+        if len(segs) >= 2:
+            prev, last = segs[-2], segs[-1]
+            prefix = "" if "api-" in prev else prev
+            raw = f"{prefix}{last}{teatime}{token}"
+        elif segs:
+            raw = f"{segs[-1]}{teatime}{token}"
+        else:
+            raw = f"{teatime}{token}"
+        tea = hashlib.sha256(raw.encode()).hexdigest()
+        return teatime, tea
+
+    def _mday_headers(self, path: str, *, json_body=True, is_auth=False, need_tea=True):
+        h = {
+            "User-Agent": MDAY_H5_UA,
+            "Origin": "https://c.10010.com",
+            "Referer": "https://c.10010.com/",
+            "Accept": "application/json, text/plain, */*",
+        }
+        token = self.mday_token or ""
+        if token:
+            # isAuth 接口用 Bearer，其余用 bearer（与前端一致）
+            h["Authorization"] = (
+                f"Bearer {token}" if is_auth else f"bearer {token}"
+            )
+            h["member_code"] = token
+            if need_tea:
+                teatime, tea = self._mday_tea_sign(path, token)
+                h["teatime"] = teatime
+                h["tea"] = tea
+        if json_body:
+            h["Content-Type"] = "application/json"
+        else:
+            h["Content-Type"] = "application/x-www-form-urlencoded"
+        return h
+
+    async def mday_login(self):
+        """APP ticket → OCP accesstoken（woapp/login）"""
+        ticket = await self.get_ticket(MDAY_ENTRY)
+        if not ticket:
+            # 兼容 club 入口
+            ticket = await self.get_ticket("https://club.10010.com/index.html")
+        if not ticket:
+            self.tlog("获取 ticket 失败")
+            return False
+        path = "/api-auth/oauth/woapp/login"
+        r = await self.req(
+            "POST",
+            f"{MDAY_OCP}{path}",
+            data={"ticket": ticket, "channel": "woapp"},
+            headers=self._mday_headers(path, json_body=False, need_tea=False),
+        )
+        res = r.get("data") if r else None
+        if not isinstance(res, dict) or str(res.get("code")) not in ("0", "0000"):
+            self.tlog(f"OCP登录失败: {api_response_err(r, 'woapp/login')}")
+            return False
+        data = res.get("data") if isinstance(res.get("data"), dict) else {}
+        token = str(data.get("accesstoken") or data.get("accessToken") or "")
+        if not token:
+            self.tlog(f"OCP登录无 token: {str(res)[:180]}")
+            return False
+        self.mday_token = token
+        phone = str(data.get("phone") or "")
+        self.tlog(f"OCP登录成功: {phone or '已授权'}")
+        return True
+
+    async def mday_api(self, path, body=None, form=False, is_auth=False):
+        if not path.startswith("/"):
+            path = "/" + path
+        url = f"{MDAY_OCP}{path}"
+        kw = {
+            "headers": self._mday_headers(
+                path, json_body=not form, is_auth=is_auth, need_tea=True
+            )
+        }
+        if form:
+            kw["data"] = body or {}
+        else:
+            kw["json"] = body if body is not None else {}
+        return await self.req("POST", url, **kw)
+    async def mday_task(self):
+        """
+        7月客户日：
+          ticket → woapp/login → 07/init → 07/answer → createKey → drawLottery
+          → mdayarea/sign
+        中文密令仅展示；真正抽奖短码由 createKey.msg 下发（前端不写死）。
+        """
+        self._task_tag = "客户日"
+        self.tlog("开始")
+        try:
+            if not await self.mday_login():
+                return
+
+            act_id, ap_id = MDAY_ACT_ID, MDAY_AP_ID
+            r = await self.mday_api(
+                "/api-lucky/activity/07/init",
+                {"act_id": act_id, "ap_id": ap_id},
+            )
+            res = r.get("data") if r else None
+            if not isinstance(res, dict) or str(res.get("code")) not in ("0", "0000"):
+                self.tlog(f"init失败: {api_response_err(r, '07/init')}")
+                return
+            payload = res.get("data") if isinstance(res.get("data"), dict) else {}
+            qlist = payload.get("questionList") or []
+            if not isinstance(qlist, list) or not qlist:
+                self.tlog(f"init无题目: {str(payload)[:180]}")
+                return
+
+            today = datetime.now().strftime("%Y-%m-%d")
+            q = None
+            for item in qlist:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("dayId") or "") == today:
+                    q = item
+                    break
+            if q is None:
+                # 取第一道未完成或带 result 的
+                for item in qlist:
+                    if isinstance(item, dict) and item.get("result") in (None, "", 0, "0"):
+                        q = item
+                        break
+                if q is None and isinstance(qlist[0], dict):
+                    q = qlist[0]
+            if not q:
+                self.tlog("未找到今日题目")
+                return
+
+            qid = q.get("id")
+            day_ap = str(q.get("apId") or ap_id)
+            title = str(q.get("title") or q.get("description") or "")[:40]
+            already = q.get("result") in (1, "1")
+            drawn = q.get("draw") in (1, "1", True)
+            self.tlog(
+                f"今日题 id={qid} day={q.get('dayId')} 「{title}」 "
+                f"已答={already} 已抽={drawn} apId={day_ap[-8:]}"
+            )
+
+            keyword = ""
+            if not already:
+                # 优先用服务端下发的 answerIndex；否则顺序试 1..3
+                candidates = []
+                hint = q.get("answerIndex")
+                if hint not in (None, ""):
+                    try:
+                        candidates.append(int(hint))
+                    except (TypeError, ValueError):
+                        pass
+                for i in (1, 2, 3):
+                    if i not in candidates:
+                        candidates.append(i)
+                answered = False
+                for ans in candidates:
+                    r = await self.mday_api(
+                        "/api-lucky/activity/07/answer",
+                        {
+                            "act_id": act_id,
+                            "ap_id": ap_id,
+                            "questionId": qid,
+                            "answerIndex": ans,
+                        },
+                    )
+                    res = r.get("data") if r else None
+                    if not isinstance(res, dict):
+                        self.tlog(f"answer异常: {api_response_err(r, '07/answer')}")
+                        continue
+                    data = res.get("data") if isinstance(res.get("data"), dict) else {}
+                    # 跨天刷新
+                    if data.get("dayId") and str(data.get("dayId")) != str(
+                        q.get("dayId") or today
+                    ):
+                        self.tlog(f"题目已跨天刷新: {data.get('dayId')}")
+                        return
+                    result = data.get("result")
+                    if result in (1, "1"):
+                        keyword = str(data.get("keyword") or "")
+                        self.tlog(
+                            f"答题正确 index={ans} 密令={keyword or '(空)'}"
+                        )
+                        answered = True
+                        break
+                    if result in (0, "0"):
+                        self.tlog(f"答错 index={ans}，重试")
+                        continue
+                    self.tlog(f"answer返回: {str(res)[:160]}")
+                if not answered:
+                    self.tlog("答题失败，跳过抽奖")
+                else:
+                    already = True
+            else:
+                self.tlog("今日已答过，直接尝试抽奖")
+
+            # 抽奖：createKey(apId=当日题apId, code=accesstoken) → msg 短码 → drawLottery
+            if already and not drawn:
+                r = await self.mday_api(
+                    "/api-lucky/activity/createKey",
+                    {"apId": day_ap, "code": self.mday_token},
+                )
+                res = r.get("data") if r else None
+                short = ""
+                if isinstance(res, dict):
+                    # 成功时短码在 msg；也可能在 data
+                    if str(res.get("code")) in ("0", "0000"):
+                        short = str(res.get("msg") or "")
+                        if short in ("成功", "success", "null", "None"):
+                            short = ""
+                        if not short and res.get("data") not in (None, ""):
+                            short = str(res.get("data"))
+                if not short:
+                    self.tlog(f"createKey失败: {api_response_err(r, 'createKey')}")
+                else:
+                    self.tlog(f"抽奖短码={short}")
+                    r = await self.mday_api(
+                        "/api-lucky/winAward/drawLottery",
+                        {
+                            "act_id": act_id,
+                            "ap_id": day_ap,
+                            "code": short,
+                        },
+                    )
+                    res = r.get("data") if r else None
+                    if isinstance(res, dict) and str(res.get("code")) in ("0", "0000"):
+                        data = (
+                            res.get("data")
+                            if isinstance(res.get("data"), dict)
+                            else {}
+                        )
+                        name = data.get("la_name") or data.get("awardName") or res.get(
+                            "msg"
+                        )
+                        self.tlog(f"抽奖结果: {name or str(data)[:120] or '成功'}")
+                    else:
+                        self.tlog(f"抽奖失败: {api_response_err(r, 'drawLottery')}")
+            elif drawn:
+                self.tlog("今日已抽过，跳过")
+
+            # 专区签到（前端 isAuth → Bearer）
+            r = await self.mday_api(
+                "/api-activity/activity/mdayarea/sign", {}, is_auth=True
+            )
+            res = r.get("data") if r else None
+            if isinstance(res, dict) and str(res.get("code")) in ("0", "0000"):
+                self.tlog(f"签到: {res.get('msg') or '成功'} data={res.get('data')}")
+            else:
+                self.tlog(f"签到: {api_response_err(r, 'mdayarea/sign')}")
+
+            r = await self.mday_api(
+                "/api-activity/activity/mdayarea/querySignList",
+                {},
+                is_auth=True,
+            )
+            res = r.get("data") if r else None
+            if isinstance(res, dict) and isinstance(res.get("data"), list):
+                today_item = next(
+                    (
+                        x
+                        for x in res["data"]
+                        if isinstance(x, dict) and x.get("today") in (1, "1")
+                    ),
+                    None,
+                )
+                if today_item:
+                    self.tlog(
+                        f"签到日历: day={today_item.get('id')} "
+                        f"status={today_item.get('status')}"
+                    )
+        except Exception as e:
+            self.tlog_exc(e, "mday_task")
+        finally:
+            self.tlog("结束")
+            self._task_tag = None
+
     # === 主任务 ===
     async def run(self):
         try:
             if not await self.login():
                 return
-            for task in [
-                self.market_task,
-                self.sign_task,
-                self.xj_task,
-                self.ttlxj_task,
-                self.ltzf_task,
-                self.sec_task,
-                self.farm_task,
-                self.cloud_battle_task,
-                self.shangdu_task,
-                self.uphone_task,
-            ]:
+            only = os.environ.get("UNICOM_ONLY_TASK", "").strip()
+            task_map = {
+                "market": self.market_task,
+                "sign": self.sign_task,
+                "xj": self.xj_task,
+                "ttlxj": self.ttlxj_task,
+                "ltzf": self.ltzf_task,
+                "sec": self.sec_task,
+                "farm": self.farm_task,
+                "cloud_battle": self.cloud_battle_task,
+                "shangdu": self.shangdu_task,
+                "uphone": self.uphone_task,
+                "mday": self.mday_task,
+            }
+            if only:
+                names = [n.strip() for n in only.split(",") if n.strip()]
+                tasks = [task_map[n] for n in names if n in task_map]
+                if not tasks:
+                    self.log(f"UNICOM_ONLY_TASK={only!r} 无匹配任务，可选: {list(task_map)}")
+                    return
+            else:
+                tasks = [
+                    self.market_task,
+                    self.sign_task,
+                    self.xj_task,
+                    self.ttlxj_task,
+                    self.ltzf_task,
+                    self.sec_task,
+                    self.farm_task,
+                    self.cloud_battle_task,
+                    self.shangdu_task,
+                    self.uphone_task,
+                    self.mday_task,
+                ]
+            for task in tasks:
                 try:
                     await task()
                 except Exception as e:
